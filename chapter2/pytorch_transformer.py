@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 # TODO decoder 最后结果要过linear 层 和softmax
 # TODO decoder 需要 embedding 和positionembedding
@@ -77,6 +77,67 @@ class LearnablePositionalEncoding(torch.nn.Module):
         # 将位置编码添加到输入的特征上
         out = x + self.encoding[:, :x.size(1), :]
         return out 
+
+class PositionwiseFeedForward(nn.Module):
+    # 前馈网络层,包含两个线性映射和一个ReLU激活
+    # 初始化时指定输入维度d_model和内部维度d_ff以及dropout比例
+    # 第一个线性层将d_model映射到d_ff,第二个线性层将d_ff映射回d_model
+    # 前向传播时,先通过第一个线性层,然后对输出施加ReLU激活
+    # 再通过dropout,并对输出施加第二个线性层
+    def __init__(self, d_model, d_ff=2048, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # 首先通过第一个线性层映射,并应用ReLU激活
+        output = self.w_1(x)
+        output = F.relu(output)
+        
+        # 然后通过dropout,并执行第二个线性层映射
+        output = self.dropout(output)
+        output = self.w_2(output)
+        return output
+
+class LayerNorm(nn.Module):
+    # 使用计算出的均值和方差对特征进行归一化，确保输出特征的均值为0，方差为1。
+    # 输入x:[batch_size, seq_len, d_model]
+    # 输出out:[batch_size, seq_len, d_model]
+    def __init__(self, d_model, eps=1e-12):
+        super(LayerNorm, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        # 设定一个小的常数，避免除零操作
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        # 计算输入x的最后一维的均值
+        # '-1' 是指最后一个维度. 
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, unbiased=False, keepdim=True)
+        # 根据均值和方差进行归一化处理
+        out = (x - mean) / torch.sqrt(var + self.eps)
+        out = self.gamma * out + self.beta
+        return out
+
+class AddNorm(nn.Module):
+    # 注意我们这里采用先求子层计算结果与原始输入x相加后再进行归一化处理，也可以先norm_first的方式
+    def __init__(self, d_model: int, eps=1e-12):
+        # 初始化，d_model指定特征维度
+        # epsilon 是一个很小的数，用于防止除以零错误，提高数值稳定性
+        super(AddNorm, self).__init__()
+        # 注意在transformer中层归一化是对单个样本的所有特征进行归一化
+        self.layer_norm = LayerNorm(d_model, eps)
+
+    def forward(self, x, sublayer_out):
+        # 首先对输入进行归一化处理，求得子层的输出, 
+        # sublayer 是上一个子层的结果
+        # 将输入x与子层输出通过相加的方式相连
+        added = x + sublayer_out
+        out = self.layer_norm(added)
+        return out
 
 class ScaledDotProductAttention(nn.Module):
     # 缩放点积注意力层,用于计算Query,Key,Value之间的注意力权重
@@ -175,7 +236,7 @@ class MultiHeadAttention(nn.Module):
         # 将掩码mask扩展成多头情况,代表对于每个head的mask
         if mask is not None:
             mask = mask.unsqueeze(1)
-            # mask : [batch_size, 1, seq_len, seq_len] -> [batch_size, num_heads, seq_len, seq_len]
+            # mask : [batch_size, seq_len, seq_len] -> [batch_size, 1, seq_len, seq_len]
         
         # 对每一个head进行缩放点积
         # attn_output:[batch_size, num_heads, seq_len, head_dim]
@@ -192,127 +253,6 @@ class MultiHeadAttention(nn.Module):
         out = self.out_linear(out)
         out = self.dropout(out)
         return out, attn_weights
-
-class PositionwiseFeedForward(nn.Module):
-    # 前馈网络层,包含两个线性映射和一个ReLU激活
-    # 初始化时指定输入维度d_model和内部维度d_ff以及dropout比例
-    # 第一个线性层将d_model映射到d_ff,第二个线性层将d_ff映射回d_model
-    # 前向传播时,先通过第一个线性层,然后对输出施加ReLU激活
-    # 再通过dropout,并对输出施加第二个线性层
-    def __init__(self, d_model, d_ff=2048, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # 首先通过第一个线性层映射,并应用ReLU激活
-        output = self.w_1(x)
-        output = F.relu(output)
-        
-        # 然后通过dropout,并执行第二个线性层映射
-        output = self.dropout(output)
-        output = self.w_2(output)
-        return output
-
-class LayerNorm(nn.Module):
-    # 使用计算出的均值和方差对特征进行归一化，确保输出特征的均值为0，方差为1。
-    # 输入x:[batch_size, seq_len, d_model]
-    # 输出out:[batch_size, seq_len, d_model]
-    def __init__(self, d_model, eps=1e-12):
-        super(LayerNorm, self).__init__()
-        self.gamma = nn.Parameter(torch.ones(d_model))
-        self.beta = nn.Parameter(torch.zeros(d_model))
-        # 设定一个小的常数，避免除零操作
-        self.eps = eps
-
-    def forward(self, x):
-        # x: (batch, seq_len, d_model)
-        # 计算输入x的最后一维的均值
-        # '-1' 是指最后一个维度. 
-        mean = x.mean(-1, keepdim=True)
-        var = x.var(-1, unbiased=False, keepdim=True)
-        # 根据均值和方差进行归一化处理
-        out = (x - mean) / torch.sqrt(var + self.eps)
-        out = self.gamma * out + self.beta
-        return out
-
-class AddNorm(nn.Module):
-    # 注意我们这里采用先求子层计算结果与原始输入x相加后再进行归一化处理，也可以先norm_first的方式
-    def __init__(self, d_model: int, eps=1e-12):
-        # 初始化，d_model指定特征维度
-        # epsilon 是一个很小的数，用于防止除以零错误，提高数值稳定性
-        super(AddNorm, self).__init__()
-        # 注意在transformer中层归一化是对单个样本的所有特征进行归一化
-        self.layer_norm = LayerNorm(d_model, eps)
-
-    def forward(self, x, sublayer_out):
-        # 首先对输入进行归一化处理，求得子层的输出, 
-        # sublayer 是上一个子层的结果
-        # 将输入x与子层输出通过相加的方式相连
-        added = x + sublayer_out
-        out = self.layer_norm(added)
-        return out
-
-class DecoderLayer(nn.Module):
-    """
-    # 解码器层,集成了两个多头注意力层和一个前馈网络层
-    # 第一个多头注意力层用于编码当前序列,并施加掩码以忽略非法连接
-    # 第二个多头注意力层用于将解码器输出与编码器输出进行合并
-    # 两次多头注意力后,都要进行残差连接和LayerNorm归一化
-    # 最后通过前馈网络层,并再次执行残差连接和LayerNorm
-    # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
-    """
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float) -> None:
-        super(DecoderLayer, self).__init__()
-        # self attention layer, 只使用decoder自己的的输入进行计算
-        self.masked_multi_head_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        # corss attention layer， 用encoder的输出结果与decoder的输入进行计算
-        self.multi_head_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.addNorm_layernorms = nn.ModuleList([AddNorm(d_model) for _ in range(3)])
-
-    def forward(self, dec_inputs, enc_outputs, 
-                src_mask: Optional[torch.Tensor], 
-                tgt_mask: Optional[torch.Tensor]):
-        # 首先通过第一个多头注意力,其中会对解码器输入序列进行掩蔽,保证不会关注后续位置
-        dec_attn_output, dec_attn_weights = self.masked_multi_head_attn(dec_inputs, dec_inputs, dec_inputs, tgt_mask)
-        dec_output = self.addNorm_layernorms[0](dec_inputs, dec_attn_output)
-
-        # 然后通过第二个多头注意力层,结合编码器输出进行计算
-        dec_enc_output, dec_enc_attn_weights = self.multi_head_attn(dec_output, enc_outputs, enc_outputs, src_mask)
-        dec_output = self.addNorm_layernorms[1](dec_output, dec_enc_output)
-
-        # 最后通过前馈网络层
-        ff_output = self.ff(dec_output)
-        dec_output = self.addNorm_layernorms[2](dec_output, ff_output)
-
-        return dec_output, dec_attn_weights, dec_enc_attn_weights
-
-class Decoder(nn.Module):
-    # 完整的Decoder模块,可以由多个DecoderLayer层组成
-    # dec_inputs: [batch, seq_len, d_model]
-    def __init__(self, d_model: int,  num_heads: int, n_layers: int, d_ff: int, dropout: float) -> None:
-        # 初始化时指定模型参数d_model,num_heads和层数num_layers  
-        super(Decoder, self).__init__()
-        self.layers = nn.ModuleList([DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(n_layers)])
-
-    def forward(self, dec_inputs, enc_outputs, 
-                src_mask: Optional[torch.Tensor] = None, 
-                tgt_mask: Optional[torch.Tensor] = None):
-        # 在forward函数中,输入依次通过每个DecoderLayer,并收集所有层的注意力权重
-        outputs = dec_inputs
-        dec_attn_weights = []
-        dec_enc_attn_weights = []
-
-        # 分别对decoder的所有层的进行计算
-        for layer in self.layers:
-            outputs, attn_weights, enc_attn_weights = layer(outputs, enc_outputs, src_mask, tgt_mask)
-            dec_attn_weights.append(attn_weights)
-            dec_enc_attn_weights.append(enc_attn_weights)
-
-        # 返回输出,以及解码器自注意力权重和编码器-解码器注意力权重
-        return outputs, dec_attn_weights, dec_enc_attn_weights
 
 class EncoderLayer(nn.Module):
 # 编码器层,集成了多头注意力层和前馈网络层
@@ -360,6 +300,68 @@ class Encoder(nn.Module):
             attn_weights.append(attn_weight)
         return x, attn_weights
 
+class DecoderLayer(nn.Module):
+    """
+    # 解码器层,集成了两个多头注意力层和一个前馈网络层
+    # 第一个多头注意力层用于编码当前序列,并施加掩码以忽略非法连接
+    # 第二个多头注意力层用于将解码器输出与编码器输出进行合并
+    # 两次多头注意力后,都要进行残差连接和LayerNorm归一化
+    # 最后通过前馈网络层,并再次执行残差连接和LayerNorm
+    # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
+    """
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float) -> None:
+        super(DecoderLayer, self).__init__()
+        # self attention layer, 只使用decoder自己的的输入进行计算
+        self.masked_multi_head_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        # corss attention layer， 用encoder的输出结果与decoder的输入进行计算
+        self.multi_head_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.addNorm_layernorms = nn.ModuleList([AddNorm(d_model) for _ in range(3)])
+
+    def forward(self, dec_inputs, enc_outputs, 
+                src_mask: Optional[torch.Tensor], 
+                tgt_mask: Optional[torch.Tensor]):
+        # 首先通过第一个多头注意力,其中会对解码器输入序列进行掩蔽,保证不会关注后续位置
+        dec_attn_output, dec_attn_weights = self.masked_multi_head_attn(
+            dec_inputs, dec_inputs, dec_inputs, tgt_mask)
+        dec_output = self.addNorm_layernorms[0](dec_inputs, dec_attn_output)
+
+        # 然后通过第二个多头注意力层,结合编码器输出进行计算
+        corss_atten_output, dec_enc_attn_weights = self.multi_head_attn(
+            dec_output, enc_outputs, enc_outputs, src_mask)
+        corss_atten_output = self.addNorm_layernorms[1](dec_output, corss_atten_output)
+
+        # 最后通过前馈网络层
+        ff_output = self.ff(corss_atten_output)
+        ff_output = self.addNorm_layernorms[2](corss_atten_output, ff_output)
+
+        return ff_output, dec_attn_weights, dec_enc_attn_weights
+
+class Decoder(nn.Module):
+    # 完整的Decoder模块,可以由多个DecoderLayer层组成
+    # dec_inputs: [batch, seq_len, d_model]
+    def __init__(self, d_model: int,  num_heads: int, n_layers: int, d_ff: int, dropout: float) -> None:
+        # 初始化时指定模型参数d_model,num_heads和层数num_layers  
+        super(Decoder, self).__init__()
+        self.layers = nn.ModuleList([DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(n_layers)])
+
+    def forward(self, dec_inputs, enc_outputs, 
+                src_mask: Optional[torch.Tensor] = None, 
+                tgt_mask: Optional[torch.Tensor] = None):
+        # 在forward函数中,输入依次通过每个DecoderLayer,并收集所有层的注意力权重
+        outputs = dec_inputs
+        dec_attn_weights = []
+        dec_enc_attn_weights = []
+
+        # 分别对decoder的所有层的进行计算
+        for layer in self.layers:
+            outputs, attn_weights, enc_attn_weights = layer(outputs, enc_outputs, src_mask, tgt_mask)
+            dec_attn_weights.append(attn_weights)
+            dec_enc_attn_weights.append(enc_attn_weights)
+
+        # 返回输出,以及解码器自注意力权重和编码器-解码器注意力权重
+        return outputs, dec_attn_weights, dec_enc_attn_weights
+
 class Transformer(nn.Module):
     # 完整的Transformer模型
     # 包含Encoder,Decoder,以及输入输出Embedding和线性映射层
@@ -371,24 +373,73 @@ class Transformer(nn.Module):
     #   4. 将embedded目标序列与编码器输出一起输入Decoder
     #   5. 将解码器输出通过最后的线性层,得到词汇空间的输出    
     #   6. 返回模型输出以及编码器/解码器注意力权重
-    def __init__(self, src_vocab_size, tgt_vocab_size, d_model=512, num_heads=8, num_layers=6):
+    def __init__(self, src_vocab_size: int, tgt_vocab_size: int, 
+                 d_model: int = 512, num_heads: int = 8, 
+                 num_encoder_layers: int = 6, num_decoder_layers: int = 6, 
+                 d_ff: int = 2048, dropout: float = 0.1):
         super(Transformer, self).__init__()
-        self.encoder = Encoder(d_model, num_heads, num_layers)
-        self.decoder = Decoder(d_model, num_heads, num_layers)
-        self.out_linear = nn.Linear(d_model, tgt_vocab_size)
+        # 定义源序列和目标序列的嵌入层
+        self.src_embedding = InputEmbeddings(d_model, src_vocab_size)
+        self.tgt_embedding = InputEmbeddings(d_model, tgt_vocab_size)
         
-        self.src_emb = nn.Embedding(src_vocab_size, d_model)
-        self.tgt_emb = nn.Embedding(tgt_vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model)
-
-    def forward(self, src, tgt, src_mask, tgt_mask):
-        src_emb = self.pos_encoder(self.src_emb(src))
-        tgt_emb = self.pos_encoder(self.tgt_emb(tgt))
-        enc_output, enc_attn_weights = self.encoder(src_emb, src_mask)
-        dec_output, dec_attn_weights, dec_enc_attn_weights = self.decoder(tgt_emb, enc_output, tgt_mask, src_mask)
-        output = self.out_linear(dec_output)
-        return output, dec_attn_weights, dec_enc_attn_weights
+        # 定义位置编码层
+        self.positional_encoding = PositionalEncoding(d_model, dropout=dropout)
+        
+        # 定义编码器和解码器
+        self.encoder = Encoder(d_model, num_heads, num_encoder_layers, d_ff, dropout)
+        self.decoder = Decoder(d_model, num_heads, num_decoder_layers, d_ff, dropout)
+        
+        # 定义输出全连接层，将d_model维度转换为目标词汇表大小
+        self.fc_out = nn.Linear(d_model, tgt_vocab_size)
+        
+    def make_src_mask(self, src: torch.Tensor) -> torch.Tensor:
+        # src:[batch_size, src_len]
+        # 创建源序列掩码: [batch_size, 1, src_len]
+        # 掩码中值为0的地方表示需要忽略的位置
+        src_mask = (src != 0).unsqueeze(1)
+        return src_mask
     
+    def make_tgt_mask(self, tgt: torch.Tensor) -> torch.Tensor:
+        # tgt: [batch_size, tgt_len]
+        # 创建目标序列掩码: [batch_size, tgt_len, tgt_len]
+        batch_size, tgt_len = tgt.size()
+
+        # 下三角矩阵掩码，保证每个位置只能看到前面的位置
+        # 掩码中值为0的地方表示需要忽略的位置
+        tgt_mask = torch.tril(
+            torch.ones((tgt_len, tgt_len), device=tgt.device)
+            ).bool()
+        tgt_mask = tgt_mask.unsqueeze(0)
+        tgt_mask = tgt_mask.repeat(batch_size, 1, 1)
+        return tgt_mask
+    
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        src: [batch_size, src_length]
+        tgt:
+        return: 
+        """
+        # 获取源序列和目标序列的掩码
+        src_mask = self.make_src_mask(src)
+        tgt_mask = self.make_tgt_mask(tgt)
+        
+        # 编码器处理源序列，并生成编码后的表示和注意力权重
+        src_emb = self.src_embedding(src) # [batch_size, src_len, d_model]
+        src_emb = self.positional_encoding(src_emb) # [batch_size, src_len, d_model]
+        enc_src, enc_attn_weights = self.encoder(src_emb, src_mask)
+        
+        # 解码器处理目标序列和编码器输出，并生成解码后的表示和注意力权重
+        dec_output, dec_attn_weights, dec_enc_attn_weights = self.decoder(
+            self.positional_encoding(self.tgt_embedding(tgt)),
+            enc_src, src_mask, tgt_mask
+        )
+        
+        # 通过全连接层生成最终输出
+        out = self.fc_out(dec_output)
+        
+        # 返回输出、编码器注意力权重、解码器自注意力权重、解码器编码器注意力权重
+        return out, enc_attn_weights, dec_attn_weights, dec_enc_attn_weights
 
 class TextClassifier(nn.Module):
     # 使用Transformer作为编码器的文本分类模型

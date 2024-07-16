@@ -3,8 +3,9 @@
 from chapter2.pytorch_transformer import (
     ScaledDotProductAttention, MultiHeadAttention, 
     PositionwiseFeedForward, AddNorm, EncoderLayer,Encoder,
-    Decoder, DecoderLayer,
-    LearnablePositionalEncoding, InputEmbeddings, PositionalEncoding)
+    LearnablePositionalEncoding, InputEmbeddings, PositionalEncoding,
+    Decoder, DecoderLayer, Transformer,
+    )
 import pytest
 import torch
 import math
@@ -16,7 +17,6 @@ def common_input():
     batch_size, seq_len, d_model = 2, 10, 512
     dummy_input = torch.rand(batch_size, seq_len, d_model)
     return dummy_input, batch_size, seq_len, d_model
-
 
 # =================== Test cases for the ScaledDotProductAttention class ===================
 class TestScaledDotProductAttention():
@@ -64,7 +64,6 @@ class TestScaledDotProductAttention():
         assert attn_weights.shape == (q.shape[0], q.shape[1], q.shape[2], q.shape[2])
         assert (attn_weights[:, :, 1, 1] < 1e-6).all()  # 检查掩码是否生效
 
-
 # =================== Test cases for the MultiHeadAttention class ===================
 class TestMultiHeadAttention:
     @pytest.fixture
@@ -79,7 +78,6 @@ class TestMultiHeadAttention:
         output, attn_weights = multi_head_attn(dummy_input, dummy_input, dummy_input)
         assert output.shape == (dummy_input.size(0), dummy_input.size(1), multi_head_attn.d_model)
         assert attn_weights.shape == (dummy_input.size(0), multi_head_attn.num_heads, dummy_input.size(1), dummy_input.size(1))
-
 
 # =================== Test cases for the PositionwiseFeedForward class ===================
 class TestPositionwiseFeedForward:
@@ -102,7 +100,6 @@ class TestPositionwiseFeedForward:
         assert not torch.isnan(output).any(), "Output should not contain NaNs"
         assert model.w_1.in_features == d_model and model.w_1.out_features == d_ff, "First linear layer dimensions are incorrect"
         assert model.w_2.in_features == d_ff and model.w_2.out_features == d_model, "Second linear layer dimensions are incorrect"
-
 
 #=================== Test cases for the AddNorm class ===================
 class TestAddNorm:
@@ -134,7 +131,6 @@ class TestAddNorm:
         # Ensuring that output is indeed different from both inputs unless x and sublayer_output are zeros
         assert not torch.all(torch.eq(output, x)), "Output should not be identical to input x"
         assert not torch.all(torch.eq(output, sublayer_output)), "Output should not be identical to sublayer output"
-
 
 #=================== Test cases for the PositionalEncoding class ===================
 class TestPositionalEncoding: 
@@ -184,7 +180,6 @@ class TestInputEmbeddings:
 
         expected_shape = (sample_input.shape[0], sample_input.shape[1], d_model)
         assert output.shape == expected_shape
-
 
 #=================== Test cases for the Encoder class ===================
 class TestEncoder():
@@ -273,3 +268,52 @@ class TestDecoder:
             assert attn_weights.size() == (batch_size, num_heads, seq_len, seq_len)
         for enc_attn_weights in dec_enc_attn_weights:
             assert enc_attn_weights.size() == (batch_size, num_heads, seq_len, seq_len)
+
+#=================== Test cases for the decoder class ===================
+class TestTransformer:
+    @pytest.fixture
+    def transformer_model(self):
+        src_vocab_size = 1345
+        tgt_vocab_size = 234
+        d_model = 512
+        num_heads = 4
+        num_encoder_layers = 3
+        num_decoder_layers = 2
+        d_ff = 256
+        dropout = 0.1
+
+        model = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, num_encoder_layers, num_decoder_layers, d_ff, dropout)
+        return model, num_heads, num_encoder_layers, num_decoder_layers
+
+    @pytest.fixture
+    def sample_inputs(self):
+        batch_size = 7
+        src_len = 54
+        tgt_len = 11
+
+        src = torch.randint(0, 1345, (batch_size, src_len))
+        tgt = torch.randint(0, 234, (batch_size, tgt_len))
+        return src, tgt
+
+    def test_transformer_forward(self, transformer_model, sample_inputs):
+        model, num_heads, num_encoder_layers, num_decoder_layers = transformer_model
+        src, tgt = sample_inputs
+
+        out, enc_attn_weights, dec_attn_weights, dec_enc_attn_weights = model(src, tgt)
+        
+        # 检查输出的形状是否正确
+        assert out.shape == (src.size(0), tgt.size(1), model.fc_out.out_features)
+        
+        # 检查注意力权重的形状是否正确
+        assert len(enc_attn_weights) == num_encoder_layers
+        assert enc_attn_weights[0].shape == (src.size(0), num_heads, src.size(1), src.size(1))
+        
+        assert len(dec_attn_weights) == num_decoder_layers
+        assert dec_attn_weights[0].shape == (src.size(0), num_heads, tgt.size(1), tgt.size(1))
+        
+        assert len(dec_enc_attn_weights) == num_decoder_layers
+        assert dec_enc_attn_weights[0].shape == (src.size(0), num_heads, tgt.size(1), src.size(1))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
