@@ -1,270 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 import math
+from typing import Optional
 
-
-class ScaledDotProductAttention(nn.Module):
-    # 缩放点积注意力层,用于计算Query,Key,Value之间的注意力权重
-    # 输入为Q,K,V向量,维度为(batch_size,num_heads,seq_len,head_dim)
-    # 首先计算Q与K的点积,对应论文公式中的QK^T
-    # 使用根号下QK^T的维度大小对点积结果进行缩放(缩小张量的方差)
-    # 如果提供了掩码mask,将掩码为0的位置的分数设为一个非常小的值,以无视这些位置
-    # 对缩放的点积求softmax,得到最终的注意力权重
-    # 将注意力权重与V向量相乘,得到加权后的注意力值,作为该层的输出
-    def __init__(self):
-        super(ScaledDotProductAttention, self).__init__()
-
-    def forward(self, q, k, v, mask=None):
-        # q,k,v [batch_size, num_heads, seq_len, head_dim]
-        head_dim = q.size(-1)
-
-        # 得到scores/attn_weights大小: [batch_size, num_heads, seq_len, seq_len]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(head_dim, dtype=torch.float32))
-        
-        if mask is not None:
-            # 对计算出的注意力分数加上掩码
-            scores = scores.masked_fill(mask == 0, -1e9)
-        # 对注意力分数计算softmax
-        attn_weights = F.softmax(scores, dim=-1)
-
-        # 将注意力分数与Value相乘,得到指定输出维度
-        # output:[batch_size, num_heads, seq_len, head_dim]
-        output = torch.matmul(attn_weights, v)
-        return output, attn_weights
-
-
-class MultiHeadAttention(nn.Module):
-    # 多头注意力层,与缩放点积注意力层的区别在于,对每个head进行了并行计算
-    # 输入向量大小[batch_size, seq_len, word_emb_d]
-    # 初始化时指定词镶嵌维度大小word_emb_d，模型维度d_model和head数量num_heads,根据d_model计算每个head的维度head_dim
-    # 通过线性映射分别得到Q,K,V向量,它们的形状为[batch_size,num_heads,seq_len,head_dim]
-    # 如果提供了掩码mask,就对其扩展成多头情况的掩码[batch_size,num_heads,seq_len,seq_len]
-    # 对于每个head,分别计算Q,K,V的缩放点积注意力,得到每个head的输出和注意力权重
-    # 将所有head的输出沿着head维度concatenate起来
-    # 最终通过线性映射输出形状为[batch_size,seq_len,d_model]结果
-    def __init__(self, d_model=512, num_heads=6, word_emb_d=None):
-        super(MultiHeadAttention, self).__init__()
-        if word_emb_d is None:
-            word_emb_d = d_model
-            
-        # d_model 维度是所有head维度的总和，所以这里要确保d_model可以被head整除
-        assert d_model % num_heads == 0
+class InputEmbeddings(nn.Module):
+    # 输入信息的向量化， 将输入标记转换为嵌入向量
+    # d_model 输入给模型的维度向量
+    # vocab_size 词典的单词总数
+    def __init__(self, d_model: int, vocab_size: int) -> None:
+        super().__init__()
         self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // self.num_heads
-
-        # 线性映射分别得到Q,K,V向量
-        self.q_linear = nn.Linear(word_emb_d, d_model) 
-        self.v_linear = nn.Linear(word_emb_d, d_model)  
-        self.k_linear = nn.Linear(word_emb_d, d_model)
-
-        # 缩放点积运算层
-        self.scale_dotp_atten = ScaledDotProductAttention()
-        # 最终的线性输出层
-        self.out_linear = nn.Linear(d_model, d_model)
-
-    def head_split(self, all_heads_tensor):
-        """
-        将d_model按照头数分割
-        : 输入all_heads_tensor: [batch_size, seq_leng, d_model]
-        : 输出head_tensor: [batch_size, c, seq_len, head_dim]
-        """
-        batch_size, seq_len, _ = all_heads_tensor.size()
-
-        # 变换维度为[batch_size, num_heads, seq_len, head_dim]
-        head_tensor = all_heads_tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        return head_tensor
-
-    def forward(self, q, k, v, mask=None):
-        # q, k, v 输入维度是[batch_size, seq_len, word_emb_d]
-        batch_size, seq_len, _  = q.size()
-        #      得到的新向量为[batch_size, seq_len, d_model]
-        q = self.q_linear(q) 
-        k = self.q_linear(k)
-        v = self.q_linear(v)
-
-        # 得到每一个head 的独立矩阵[batch_size, num_heads, seq_len, head_dim]
-        q = self.head_split(q)
-        k = self.head_split(k)
-        v = self.head_split(v)
-        
-        # 将掩码mask扩展成多头情况,代表对于每个head的mask
-        if mask is not None:
-            mask = mask.unsqueeze(1)
-            # mask : [batch_size, 1, seq_len, seq_len] -> [batch_size, num_heads, seq_len, seq_len]
-        
-        # 对每一个head进行缩放点积
-        # attn_output:[batch_size, num_heads, seq_len, head_dim]
-        # attn_weights:[batch_size, num_heads, seq_len, seq_len]
-        attn_output, attn_weights = self.scale_dotp_atten(q, k, v, mask=mask)  # attn_weights 可以用来绘图做验证
-        
-        # 将head经过缩放点积注意力计算的结果从新拼接起来
-        # 维度从[batch_size, head, seq_len, head_dim] 到 [batch_size, seq_len, head, head_dim] ->
-        # 得到 out: [batch_size, seq_len, d_model]
-        out = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-
-        # 最后进过一个线性层输出结果[batch_size, seq_len, d_model]
-        out = self.out_linear(out)
-        return out, attn_weights
-
-
-class PositionwiseFeedForward(nn.Module):
-    # 前馈网络层,包含两个线性映射和一个ReLU激活
-    # 初始化时指定输入维度d_model和内部维度d_ff以及dropout比例
-    # 第一个线性层将d_model映射到d_ff,第二个线性层将d_ff映射回d_model
-    # 前向传播时,先通过第一个线性层,然后对输出施加ReLU激活
-    # 再通过第二个线性层,并对输出施加dropout
-    def __init__(self, d_model, d_ff=2048, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.vocab_size = vocab_size
+        self.embedding = nn.Embedding(vocab_size, d_model)
 
     def forward(self, x):
-        # 首先通过第一个线性层映射,并应用ReLU激活
-        output = self.w_1(x)
-        output = F.relu(output)
-        
-        # 然后通过第二个线性层映射,并执行dropout
-        output = self.w_2(output)
-        output = self.dropout(output)
-        return output
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-12):
-        super(LayerNorm, self).__init__()
-        self.gamma = nn.Parameter(torch.ones(d_model))
-        self.beta = nn.Parameter(torch.zeros(d_model))
-        # 设定一个小的常数，避免除零操作
-        self.eps = eps
-
-    def forward(self, x):
-        # 计算输入x的最后一维的均值
-        # '-1' 是指最后一个维度. 
-        mean = x.mean(-1, keepdim=True)
-        var = x.var(-1, unbiased=False, keepdim=True)
-        # 根据均值和方差进行归一化处理
-        out = (x - mean) / torch.sqrt(var + self.eps)
-        out = self.gamma * out + self.beta
-        return out
-
-class AddNorm(nn.Module):
-    def __init__(self, size, eps=1e-12):
-        super(AddNorm, self).__init__()
-        self.norm = LayerNorm(size, eps)
-
-    def forward(self, x, sublayer_output):
-        # 将输入x与子层输出通过相加的方式相连
-        added = x + sublayer_output
-        # 归一化处理
-        out = self.norm(added)
-        return out
-
-class EncoderLayer(nn.Module):
-# 编码器层,集成了多头注意力层和前馈网络层
-# 最终返回归一化后的输出,以及注意力权重
-    def __init__(self, d_model, num_heads):
-    # 初始化时指定模型维度d_model和头数量num_heads
-        super(EncoderLayer, self).__init__()
-
-        #前向传播前,首先通过多头注意力层,得到注意力输出
-        self.multi_head_attn = MultiHeadAttention(d_model, num_heads)
-
-        # 并通过一个前馈网络层, 内部维度d_ff大小可以根据情况修改，这里定义为输入d_model 4倍大
-        self.ff = PositionwiseFeedForward(d_model, d_model*4)
-        
-        # 使用两个LayerNorm层,分别对注意力输出和前馈网络输出进行归一化
-        self.layernorms = nn.ModuleList([LayerNorm(d_model) for _ in range(2)])
-
-    def forward(self, x, mask):
-        # 首先通过多头注意力层，并应用掩码
-        attn_output, attn_weights = self.multi_head_attn(x, x, x, mask)
-        # 对多头注意力输出首先残差连接（注意力输出与输入X相加）然后施加LayerNorm
-        out1 = self.layernorms[0](x + attn_output)
-        # 然后通过前馈网络层
-        ff_output = self.ff(out1)
-        # 对前馈网络输出施加LayerNorm,然后残差连接
-        out2 = self.layernorms[1](out1 + ff_output)
-        
-        return out2, attn_weights
-    
-class Encoder(nn.Module):
-    # 初始化时指定模型参数d_model, num_heads和层数num_layers
-    def __init__(self, d_model, num_heads, num_layers):
-        super(Encoder, self).__init__()
-        # 完整的Encoder模块,由多个EncoderLayer层组成（num_layers）
-        self.layers = nn.ModuleList([EncoderLayer(d_model, num_heads) for _ in range(num_layers)])
-
-    def forward(self, x, mask):
-        # 在forward函数中,输入依次通过每个EncoderLayer,并收集所有层的注意力权重
-        # 最终返回最后一层的输出,以及所有层的注意力权重
-        attn_weights = []
-        for layer in self.layers:
-            x, attn_weight = layer(x, mask)
-            attn_weights.append(attn_weight)
-        return x, attn_weights
-
-
-class DecoderLayer(nn.Module):
-    """
-    # 解码器层,集成了两个多头注意力层和一个前馈网络层
-    # 第一个多头注意力层用于编码当前序列,并施加掩码以忽略非法连接
-    # 第二个多头注意力层用于将解码器输出与编码器输出进行合并
-    # 两次多头注意力后,都要进行残差连接和LayerNorm归一化
-    # 最后通过前馈网络层,并再次执行残差连接和LayerNorm
-    # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
-    """
-    def __init__(self, d_model, num_heads):
-        super(DecoderLayer, self).__init__()
-        self.masked_multi_head_attn = MultiHeadAttention(d_model, num_heads)
-        self.multi_head_attn = MultiHeadAttention(d_model, num_heads)
-        self.ff = PositionwiseFeedForward(d_model, d_model*4)
-
-        self.layernorms = nn.ModuleList([LayerNorm(d_model) for _ in range(3)])
-
-    def forward(self, dec_inputs, enc_outputs, dec_mask, enc_mask):
-        # 首先通过第一个多头注意力,对解码器输入序列进行掩蔽,保证不会关注后续位置
-        dec_attn_output, dec_attn_weights = self.masked_multi_head_attn(dec_inputs, dec_inputs, dec_inputs, dec_mask)
-        dec_output = self.layernorms[0](dec_attn_output + dec_inputs)
-
-        # 然后通过第二个多头注意力层,结合编码器输出
-        dec_enc_output, dec_enc_attn_weights = self.multi_head_attn(dec_output, enc_outputs, enc_outputs, enc_mask)
-        dec_output = self.layernorms[1](dec_enc_output + dec_output)
-
-        # 最后通过前馈网络层
-        ff_output = self.ff(dec_output)
-        dec_output = self.layernorms[2](ff_output + dec_output)
-
-        return dec_output, dec_attn_weights, dec_enc_attn_weights
-    
-
-class Decoder(nn.Module):
-    # 完整的Decoder模块,可以由多个DecoderLayer层组成
-
-    def __init__(self, d_model, num_heads, num_layers):
-        # 初始化时指定模型参数d_model,num_heads和层数num_layers  
-        super(Decoder, self).__init__()
-        self.layers = nn.ModuleList([DecoderLayer(d_model, num_heads) for _ in range(num_layers)])
-        self.norm = LayerNorm(d_model)
-
-    def forward(self, dec_inputs, enc_outputs, dec_mask, enc_mask):
-        # 在forward函数中,输入依次通过每个DecoderLayer,并收集所有层的注意力权重
-        outputs = dec_inputs
-        dec_attn_weights = []
-        dec_enc_attn_weights = []
-
-        # 最后对所有层的输出进行LayerNorm归一化
-        for layer in self.layers:
-            outputs, attn_weights, enc_attn_weights = layer(outputs, enc_outputs, dec_mask, enc_mask)
-            dec_attn_weights.append(attn_weights)
-            dec_enc_attn_weights.append(enc_attn_weights)
-
-        # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
-        return self.norm(outputs), dec_attn_weights, dec_enc_attn_weights
-
+        # x: (batch_size, seq_len)
+        # 嵌入层: (vocab_size, d_model)
+        # 输出: (batch_size, seq_len, d_model)
+        # 乘以 sqrt(d_model) 缩放嵌入
+        return self.embedding(x) * math.sqrt(self.d_model)
 
 class PositionalEncoding(torch.nn.Module):
     # 位置编码层用于将序列的位置信息编码到embedding中
@@ -318,6 +73,286 @@ class LearnablePositionalEncoding(torch.nn.Module):
         out = x + self.encoding[:, :x.size(1), :]
         return out 
 
+class ScaledDotProductAttention(nn.Module):
+    # 缩放点积注意力层,用于计算Query,Key,Value之间的注意力权重
+    # 输入为Q,K,V向量,维度为(batch_size,num_heads,seq_len,head_dim)
+    # 首先计算Q与K的点积,对应论文公式中的QK^T
+    # 使用根号下QK^T的维度大小对点积结果进行缩放(缩小张量的方差)
+    # 如果提供了掩码mask,将掩码为0的位置的分数设为一个非常小的值,以无视这些位置
+    # 对缩放的点积求softmax,并经过dropout得到最终的注意力权重
+    # 将注意力权重与V向量相乘,得到加权后的注意力值,作为该层的输出
+    # 输出out：[batch_size, num_heads, seq_len, head_dim]
+    def __init__(self, dropout: float = None):
+        super(ScaledDotProductAttention, self).__init__()
+        if dropout:
+            self.attn_dropout = nn.Dropout(p=dropout)
+        else:
+            self.attn_dropout = None
+    def forward(self, q, k, v, mask=None):
+        # q,k,v [batch_size, num_heads, seq_len, head_dim]
+        head_dim = q.size(-1)
+
+        # 得到scores/attn_weights大小: [batch_size, num_heads, seq_len, seq_len]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(head_dim, dtype=torch.float32))
+        
+        if mask is not None:
+            # 对计算出的注意力分数加上掩码,将要掩盖部分给予非常小的分数
+            scores = scores.masked_fill(mask == 0, -1e9)
+        # 对注意力分数计算softmax
+        attn_weights = F.softmax(scores, dim=-1)
+
+        if self.attn_dropout:
+            # 对注意力分数应用dropout
+            attn_weights = self.attn_dropout(attn_weights)
+
+        # 将注意力分数与Value相乘,得到指定输出维度
+        # output:[batch_size, num_heads, seq_len, head_dim]
+        output = torch.matmul(attn_weights, v)
+        return output, attn_weights
+
+class MultiHeadAttention(nn.Module):
+    # 多头注意力层,与缩放点积注意力层的区别在于,对每个head进行了并行计算
+    # 输入向量大小[batch_size, seq_len, word_emb_d]
+    # 注意力权重可以根据需要经过dropout层
+    # 初始化时指定词镶嵌维度大小word_emb_d，模型维度d_model和head数量num_heads,根据d_model计算每个head的维度head_dim
+    # 通过线性映射分别得到Q,K,V向量,它们的形状为[batch_size,num_heads,seq_len,head_dim]
+    # 如果提供了掩码mask,就对其扩展成多头情况的掩码[batch_size,num_heads,seq_len,seq_len]
+    # 对于每个head,分别计算Q,K,V的缩放点积注意力,得到每个head的输出和注意力权重
+    # 将所有head的输出沿着head维度concatenate起来
+    # 最终通过线性映射输出形状为[batch_size,seq_len,d_model]结果
+    def __init__(self, d_model: int=512, num_heads: int=4, dropout:float=0.1, word_emb_d=None):
+        super(MultiHeadAttention, self).__init__()
+        if word_emb_d is None:
+            word_emb_d = d_model
+            
+        # d_model 维度是所有head维度的总和，所以这里要确保d_model可以被head整除
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // self.num_heads
+        self.dropout = nn.Dropout(p=dropout)
+
+        # 线性映射分别得到Q,K,V向量,这里是n个头的q，k，v总和
+        self.q_linear = nn.Linear(word_emb_d, d_model) 
+        self.v_linear = nn.Linear(word_emb_d, d_model)  
+        self.k_linear = nn.Linear(word_emb_d, d_model)
+
+        # 缩放点积运算层
+        self.scale_dotp_atten = ScaledDotProductAttention(dropout=dropout)
+        # 最终的线性输出层
+        self.out_linear = nn.Linear(d_model, d_model)
+
+    def head_split(self, all_heads_tensor):
+        """
+        将d_model按照头数分割
+        : 输入all_heads_tensor: [batch_size, seq_leng, d_model]
+        : 输出head_tensor: [batch_size, c, seq_len, head_dim]
+        """
+        batch_size, seq_len, _ = all_heads_tensor.size()
+
+        # 变换维度为[batch_size, num_heads, seq_len, head_dim]
+        head_tensor = all_heads_tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        return head_tensor
+
+    def forward(self, q, k, v, mask=None):
+        # q, k, v 输入维度是[batch_size, seq_len, word_emb_d]
+        batch_size, seq_len, _  = q.size()
+        # 得到的新向量为[batch_size, seq_len, d_model]
+        q = self.q_linear(q) 
+        k = self.q_linear(k)
+        v = self.q_linear(v)
+
+        # 得到每一个head 的独立矩阵[batch_size, num_heads, seq_len, head_dim]
+        q = self.head_split(q)
+        k = self.head_split(k)
+        v = self.head_split(v)
+        
+        # 将掩码mask扩展成多头情况,代表对于每个head的mask
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+            # mask : [batch_size, 1, seq_len, seq_len] -> [batch_size, num_heads, seq_len, seq_len]
+        
+        # 对每一个head进行缩放点积
+        # attn_output:[batch_size, num_heads, seq_len, head_dim]
+        # attn_weights:[batch_size, num_heads, seq_len, seq_len]
+        # 其中attn_weights 并不直接参与后续计算，但可以用来绘图做验证
+        attn_output, attn_weights = self.scale_dotp_atten(q, k, v, mask=mask)
+        
+        # 将head经过缩放点积注意力计算的结果从新拼接起来
+        # 维度从[batch_size, head, seq_len, head_dim] 到 [batch_size, seq_len, head, head_dim] ->
+        # 得到 out: [batch_size, seq_len, d_model]
+        out = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+
+        # 最后进过一个线性层输出结果[batch_size, seq_len, d_model]
+        out = self.out_linear(out)
+        out = self.dropout(out)
+        return out, attn_weights
+
+class PositionwiseFeedForward(nn.Module):
+    # 前馈网络层,包含两个线性映射和一个ReLU激活
+    # 初始化时指定输入维度d_model和内部维度d_ff以及dropout比例
+    # 第一个线性层将d_model映射到d_ff,第二个线性层将d_ff映射回d_model
+    # 前向传播时,先通过第一个线性层,然后对输出施加ReLU激活
+    # 再通过dropout,并对输出施加第二个线性层
+    def __init__(self, d_model, d_ff=2048, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # 首先通过第一个线性层映射,并应用ReLU激活
+        output = self.w_1(x)
+        output = F.relu(output)
+        
+        # 然后通过dropout,并执行第二个线性层映射
+        output = self.dropout(output)
+        output = self.w_2(output)
+        return output
+
+class LayerNorm(nn.Module):
+    # 使用计算出的均值和方差对特征进行归一化，确保输出特征的均值为0，方差为1。
+    # 输入x:[batch_size, seq_len, d_model]
+    # 输出out:[batch_size, seq_len, d_model]
+    def __init__(self, d_model, eps=1e-12):
+        super(LayerNorm, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        # 设定一个小的常数，避免除零操作
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        # 计算输入x的最后一维的均值
+        # '-1' 是指最后一个维度. 
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, unbiased=False, keepdim=True)
+        # 根据均值和方差进行归一化处理
+        out = (x - mean) / torch.sqrt(var + self.eps)
+        out = self.gamma * out + self.beta
+        return out
+
+class AddNorm(nn.Module):
+    # 注意我们这里采用先求子层计算结果与原始输入x相加后再进行归一化处理，也可以先norm_first的方式
+    def __init__(self, d_model: int, eps=1e-12):
+        # 初始化，d_model指定特征维度
+        # epsilon 是一个很小的数，用于防止除以零错误，提高数值稳定性
+        super(AddNorm, self).__init__()
+        # 注意在transformer中层归一化是对单个样本的所有特征进行归一化
+        self.layer_norm = LayerNorm(d_model, eps)
+
+    def forward(self, x, sublayer_out):
+        # 首先对输入进行归一化处理，求得子层的输出, 
+        # sublayer 是上一个子层的结果
+        # 将输入x与子层输出通过相加的方式相连
+        added = x + sublayer_out
+        out = self.layer_norm(added)
+        return out
+
+class EncoderLayer(nn.Module):
+# 编码器层,集成了多头注意力层和前馈网络层
+# 最终返回归一化后的输出,以及注意力权重
+# 输入x:[batch_size, seq_len, d_model]
+# 输出out:[batch_size, seq_len, d_model]
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float) -> None:
+    # 初始化时指定模型维度d_model和头数量num_heads
+        super(EncoderLayer, self).__init__()
+
+        #前向传播前,首先通过多头注意力层,得到注意力输出
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+
+        # 并通过一个前馈网络层, 内部维度d_ff大小可以根据情况修改
+        self.ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+        
+        # 两个layernorms层,分别对注意力输出和前馈网络输出进行AddNorm
+        self.addNorm_layernorms = nn.ModuleList([AddNorm(d_model) for _ in range(2)])
+
+    def forward(self, x, mask):
+        # 首先通过多头注意力层，并应用掩码
+        attn_output, attn_weights = self.self_attn(x, x, x, mask)
+        # 对多头注意力输出首先残差连接（注意力输出与输入X相加）然后施加LayerNorm
+        out1 = self.addNorm_layernorms[0](x, attn_output)
+        # 然后通过前馈网络层
+        ff_output = self.ff(out1)
+        # 对前馈网络输出施加LayerNorm,然后残差连接
+        out2 = self.addNorm_layernorms[1](out1, ff_output)
+        return out2, attn_weights
+    
+class Encoder(nn.Module):
+    # 初始化时指定模型参数d_model, num_heads和层数n_layers
+    def __init__(self, d_model: int, num_heads: int, n_layers: int, d_ff: int, dropout: float) -> None:
+        super(Encoder, self).__init__()
+        # 完整的Encoder模块,由多个EncoderLayer层组成（num_layers）
+        self.layers = nn.ModuleList(
+            [EncoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(n_layers)])
+
+    def forward(self, x, mask):
+        # 在forward函数中,输入依次通过每个EncoderLayer,并收集所有层的注意力权重
+        # 最终返回最后一层的输出,以及所有层的注意力权重
+        attn_weights = []
+        for layer in self.layers:
+            x, attn_weight = layer(x, mask)
+            attn_weights.append(attn_weight)
+        return x, attn_weights
+
+
+class DecoderLayer(nn.Module):
+    """
+    # 解码器层,集成了两个多头注意力层和一个前馈网络层
+    # 第一个多头注意力层用于编码当前序列,并施加掩码以忽略非法连接
+    # 第二个多头注意力层用于将解码器输出与编码器输出进行合并
+    # 两次多头注意力后,都要进行残差连接和LayerNorm归一化
+    # 最后通过前馈网络层,并再次执行残差连接和LayerNorm
+    # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
+    """
+    def __init__(self, d_model, num_heads):
+        super(DecoderLayer, self).__init__()
+        self.masked_multi_head_attn = MultiHeadAttention(d_model, num_heads)
+        self.multi_head_attn = MultiHeadAttention(d_model, num_heads)
+        self.ff = PositionwiseFeedForward(d_model, d_model*4)
+
+        self.layernorms = nn.ModuleList([LayerNorm(d_model) for _ in range(3)])
+
+    def forward(self, dec_inputs, enc_outputs, dec_mask, enc_mask):
+        # 首先通过第一个多头注意力,对解码器输入序列进行掩蔽,保证不会关注后续位置
+        dec_attn_output, dec_attn_weights = self.masked_multi_head_attn(dec_inputs, dec_inputs, dec_inputs, dec_mask)
+        dec_output = self.layernorms[0](dec_attn_output + dec_inputs)
+
+        # 然后通过第二个多头注意力层,结合编码器输出
+        dec_enc_output, dec_enc_attn_weights = self.multi_head_attn(dec_output, enc_outputs, enc_outputs, enc_mask)
+        dec_output = self.layernorms[1](dec_enc_output + dec_output)
+
+        # 最后通过前馈网络层
+        ff_output = self.ff(dec_output)
+        dec_output = self.layernorms[2](ff_output + dec_output)
+
+        return dec_output, dec_attn_weights, dec_enc_attn_weights
+
+class Decoder(nn.Module):
+    # 完整的Decoder模块,可以由多个DecoderLayer层组成
+
+    def __init__(self, d_model, num_heads, num_layers):
+        # 初始化时指定模型参数d_model,num_heads和层数num_layers  
+        super(Decoder, self).__init__()
+        self.layers = nn.ModuleList([DecoderLayer(d_model, num_heads) for _ in range(num_layers)])
+        self.norm = LayerNorm(d_model)
+
+    def forward(self, dec_inputs, enc_outputs, dec_mask, enc_mask):
+        # 在forward函数中,输入依次通过每个DecoderLayer,并收集所有层的注意力权重
+        outputs = dec_inputs
+        dec_attn_weights = []
+        dec_enc_attn_weights = []
+
+        # 最后对所有层的输出进行LayerNorm归一化
+        for layer in self.layers:
+            outputs, attn_weights, enc_attn_weights = layer(outputs, enc_outputs, dec_mask, enc_mask)
+            dec_attn_weights.append(attn_weights)
+            dec_enc_attn_weights.append(enc_attn_weights)
+
+        # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
+        return self.norm(outputs), dec_attn_weights, dec_enc_attn_weights
+
+
 class Transformer(nn.Module):
     # 完整的Transformer模型
     # 包含Encoder,Decoder,以及输入输出Embedding和线性映射层
@@ -366,6 +401,3 @@ class TextClassifier(nn.Module):
         outputs = outputs[:, 0, :]  # 只取序列的第一个token
         logits = self.classifier(outputs)
         return logits
-
-
-
