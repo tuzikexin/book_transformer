@@ -4,6 +4,11 @@ import torch.nn.functional as F
 import math
 from typing import Optional
 
+# TODO decoder 最后结果要过linear 层 和softmax
+# TODO decoder 需要 embedding 和positionembedding
+# TODO encode 需要 embedding 和positionembedding
+# TODO 需要dataset
+
 class InputEmbeddings(nn.Module):
     # 输入信息的向量化， 将输入标记转换为嵌入向量
     # d_model 输入给模型的维度向量
@@ -249,6 +254,66 @@ class AddNorm(nn.Module):
         out = self.layer_norm(added)
         return out
 
+class DecoderLayer(nn.Module):
+    """
+    # 解码器层,集成了两个多头注意力层和一个前馈网络层
+    # 第一个多头注意力层用于编码当前序列,并施加掩码以忽略非法连接
+    # 第二个多头注意力层用于将解码器输出与编码器输出进行合并
+    # 两次多头注意力后,都要进行残差连接和LayerNorm归一化
+    # 最后通过前馈网络层,并再次执行残差连接和LayerNorm
+    # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
+    """
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float) -> None:
+        super(DecoderLayer, self).__init__()
+        # self attention layer, 只使用decoder自己的的输入进行计算
+        self.masked_multi_head_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        # corss attention layer， 用encoder的输出结果与decoder的输入进行计算
+        self.multi_head_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.addNorm_layernorms = nn.ModuleList([AddNorm(d_model) for _ in range(3)])
+
+    def forward(self, dec_inputs, enc_outputs, 
+                src_mask: Optional[torch.Tensor], 
+                tgt_mask: Optional[torch.Tensor]):
+        # 首先通过第一个多头注意力,其中会对解码器输入序列进行掩蔽,保证不会关注后续位置
+        dec_attn_output, dec_attn_weights = self.masked_multi_head_attn(dec_inputs, dec_inputs, dec_inputs, tgt_mask)
+        dec_output = self.addNorm_layernorms[0](dec_inputs, dec_attn_output)
+
+        # 然后通过第二个多头注意力层,结合编码器输出进行计算
+        dec_enc_output, dec_enc_attn_weights = self.multi_head_attn(dec_output, enc_outputs, enc_outputs, src_mask)
+        dec_output = self.addNorm_layernorms[1](dec_output, dec_enc_output)
+
+        # 最后通过前馈网络层
+        ff_output = self.ff(dec_output)
+        dec_output = self.addNorm_layernorms[2](dec_output, ff_output)
+
+        return dec_output, dec_attn_weights, dec_enc_attn_weights
+
+class Decoder(nn.Module):
+    # 完整的Decoder模块,可以由多个DecoderLayer层组成
+    # dec_inputs: [batch, seq_len, d_model]
+    def __init__(self, d_model: int,  num_heads: int, n_layers: int, d_ff: int, dropout: float) -> None:
+        # 初始化时指定模型参数d_model,num_heads和层数num_layers  
+        super(Decoder, self).__init__()
+        self.layers = nn.ModuleList([DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(n_layers)])
+
+    def forward(self, dec_inputs, enc_outputs, 
+                src_mask: Optional[torch.Tensor] = None, 
+                tgt_mask: Optional[torch.Tensor] = None):
+        # 在forward函数中,输入依次通过每个DecoderLayer,并收集所有层的注意力权重
+        outputs = dec_inputs
+        dec_attn_weights = []
+        dec_enc_attn_weights = []
+
+        # 分别对decoder的所有层的进行计算
+        for layer in self.layers:
+            outputs, attn_weights, enc_attn_weights = layer(outputs, enc_outputs, src_mask, tgt_mask)
+            dec_attn_weights.append(attn_weights)
+            dec_enc_attn_weights.append(enc_attn_weights)
+
+        # 返回输出,以及解码器自注意力权重和编码器-解码器注意力权重
+        return outputs, dec_attn_weights, dec_enc_attn_weights
+
 class EncoderLayer(nn.Module):
 # 编码器层,集成了多头注意力层和前馈网络层
 # 最终返回归一化后的输出,以及注意力权重
@@ -294,64 +359,6 @@ class Encoder(nn.Module):
             x, attn_weight = layer(x, mask)
             attn_weights.append(attn_weight)
         return x, attn_weights
-
-
-class DecoderLayer(nn.Module):
-    """
-    # 解码器层,集成了两个多头注意力层和一个前馈网络层
-    # 第一个多头注意力层用于编码当前序列,并施加掩码以忽略非法连接
-    # 第二个多头注意力层用于将解码器输出与编码器输出进行合并
-    # 两次多头注意力后,都要进行残差连接和LayerNorm归一化
-    # 最后通过前馈网络层,并再次执行残差连接和LayerNorm
-    # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
-    """
-    def __init__(self, d_model, num_heads):
-        super(DecoderLayer, self).__init__()
-        self.masked_multi_head_attn = MultiHeadAttention(d_model, num_heads)
-        self.multi_head_attn = MultiHeadAttention(d_model, num_heads)
-        self.ff = PositionwiseFeedForward(d_model, d_model*4)
-
-        self.layernorms = nn.ModuleList([LayerNorm(d_model) for _ in range(3)])
-
-    def forward(self, dec_inputs, enc_outputs, dec_mask, enc_mask):
-        # 首先通过第一个多头注意力,对解码器输入序列进行掩蔽,保证不会关注后续位置
-        dec_attn_output, dec_attn_weights = self.masked_multi_head_attn(dec_inputs, dec_inputs, dec_inputs, dec_mask)
-        dec_output = self.layernorms[0](dec_attn_output + dec_inputs)
-
-        # 然后通过第二个多头注意力层,结合编码器输出
-        dec_enc_output, dec_enc_attn_weights = self.multi_head_attn(dec_output, enc_outputs, enc_outputs, enc_mask)
-        dec_output = self.layernorms[1](dec_enc_output + dec_output)
-
-        # 最后通过前馈网络层
-        ff_output = self.ff(dec_output)
-        dec_output = self.layernorms[2](ff_output + dec_output)
-
-        return dec_output, dec_attn_weights, dec_enc_attn_weights
-
-class Decoder(nn.Module):
-    # 完整的Decoder模块,可以由多个DecoderLayer层组成
-
-    def __init__(self, d_model, num_heads, num_layers):
-        # 初始化时指定模型参数d_model,num_heads和层数num_layers  
-        super(Decoder, self).__init__()
-        self.layers = nn.ModuleList([DecoderLayer(d_model, num_heads) for _ in range(num_layers)])
-        self.norm = LayerNorm(d_model)
-
-    def forward(self, dec_inputs, enc_outputs, dec_mask, enc_mask):
-        # 在forward函数中,输入依次通过每个DecoderLayer,并收集所有层的注意力权重
-        outputs = dec_inputs
-        dec_attn_weights = []
-        dec_enc_attn_weights = []
-
-        # 最后对所有层的输出进行LayerNorm归一化
-        for layer in self.layers:
-            outputs, attn_weights, enc_attn_weights = layer(outputs, enc_outputs, dec_mask, enc_mask)
-            dec_attn_weights.append(attn_weights)
-            dec_enc_attn_weights.append(enc_attn_weights)
-
-        # 返回归一化后的输出,以及解码器自注意力权重和编码器-解码器注意力权重
-        return self.norm(outputs), dec_attn_weights, dec_enc_attn_weights
-
 
 class Transformer(nn.Module):
     # 完整的Transformer模型

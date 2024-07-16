@@ -3,6 +3,7 @@
 from chapter2.pytorch_transformer import (
     ScaledDotProductAttention, MultiHeadAttention, 
     PositionwiseFeedForward, AddNorm, EncoderLayer,Encoder,
+    Decoder, DecoderLayer,
     LearnablePositionalEncoding, InputEmbeddings, PositionalEncoding)
 import pytest
 import torch
@@ -65,18 +66,19 @@ class TestScaledDotProductAttention():
 
 
 # =================== Test cases for the MultiHeadAttention class ===================
-@pytest.fixture
-def setup_attention(common_input):
-    num_heads = 8
-    dummy_input, batch_size, seq_len, d_model = common_input
-    multi_head_attn = MultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=0.1)
-    return multi_head_attn, dummy_input
+class TestMultiHeadAttention:
+    @pytest.fixture
+    def setup_attention(self, common_input):
+        num_heads = 8
+        dummy_input, batch_size, seq_len, d_model = common_input
+        multi_head_attn = MultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=0.1)
+        return multi_head_attn, dummy_input
 
-def test_output_shape(setup_attention):
-    multi_head_attn, dummy_input = setup_attention
-    output, attn_weights = multi_head_attn(dummy_input, dummy_input, dummy_input)
-    assert output.shape == (dummy_input.size(0), dummy_input.size(1), multi_head_attn.d_model)
-    assert attn_weights.shape == (dummy_input.size(0), multi_head_attn.num_heads, dummy_input.size(1), dummy_input.size(1))
+    def test_output_shape(self, setup_attention):
+        multi_head_attn, dummy_input = setup_attention
+        output, attn_weights = multi_head_attn(dummy_input, dummy_input, dummy_input)
+        assert output.shape == (dummy_input.size(0), dummy_input.size(1), multi_head_attn.d_model)
+        assert attn_weights.shape == (dummy_input.size(0), multi_head_attn.num_heads, dummy_input.size(1), dummy_input.size(1))
 
 
 # =================== Test cases for the PositionwiseFeedForward class ===================
@@ -190,6 +192,7 @@ class TestEncoder():
     def input_tensors(self, common_input):
         x, batch_size, seq_len, _ = common_input
         mask = torch.ones(batch_size, seq_len, seq_len)
+        mask[0,0,1] = 0
         return x, mask
 
     def test_encoder_layer_forward(self, input_tensors):
@@ -220,3 +223,53 @@ class TestEncoder():
         assert len(attn_weights) == n_layers
         for attn_weight in attn_weights:
             assert attn_weight.shape == (x.shape[0],num_heads,x.shape[1], x.shape[1])
+
+#=================== Test cases for the decoder class ===================
+class TestDecoder:
+    @pytest.fixture
+    def sample_inputs(self):
+        batch_size = 32
+        seq_len = 10
+        d_model = 512
+        return torch.randn(batch_size, seq_len, d_model)
+
+    @pytest.fixture
+    def sample_enc_outputs(self):
+        batch_size = 32
+        seq_len = 10
+        d_model = 512
+        return torch.randn(batch_size, seq_len, d_model)
+
+    @pytest.fixture
+    def sample_masks(self):
+        batch_size = 32
+        seq_len = 10
+        return torch.ones(batch_size, seq_len, seq_len)
+    
+    @pytest.fixture
+    def decoder_sample(self):
+        d_model = 512
+        num_heads = 4
+        n_layers = 3
+        d_ff = 1024
+        dropout = 0.1
+        return (Decoder(d_model, num_heads, n_layers, d_ff, dropout),
+                num_heads, n_layers)
+    
+    def test_decoder_initialization(self, decoder_sample):
+        decoder, num_heads, n_layers = decoder_sample
+        assert len(decoder.layers) == n_layers
+        for layer in decoder.layers:
+            assert isinstance(layer, DecoderLayer)
+
+    def test_decoder_forward_output_shape(self, decoder_sample, sample_inputs, sample_enc_outputs, sample_masks):
+        decoder, num_heads, n_layers = decoder_sample
+        outputs, dec_attn_weights, dec_enc_attn_weights = decoder(sample_inputs, sample_enc_outputs, sample_masks, sample_masks)
+        batch_size, seq_len, d_model = sample_inputs.size()
+        assert outputs.size() == (batch_size, seq_len, d_model)
+        assert len(dec_attn_weights) == n_layers
+        assert len(dec_enc_attn_weights) == n_layers
+        for attn_weights in dec_attn_weights:
+            assert attn_weights.size() == (batch_size, num_heads, seq_len, seq_len)
+        for enc_attn_weights in dec_enc_attn_weights:
+            assert enc_attn_weights.size() == (batch_size, num_heads, seq_len, seq_len)
