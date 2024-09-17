@@ -3,11 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
-
-# TODO decoder 最后结果要过linear 层 和softmax
-# TODO decoder 需要 embedding 和positionembedding
-# TODO encode 需要 embedding 和positionembedding
-# TODO 需要dataset
+# from chapter2.data_handel import make_src_mask
 
 class InputEmbeddings(nn.Module):
     # 输入信息的向量化， 将输入标记转换为嵌入向量
@@ -92,11 +88,11 @@ class PositionwiseFeedForward(nn.Module):
 
     def forward(self, x):
         # 首先通过第一个线性层映射,并应用ReLU激活
-        output = self.w_1(x)
-        output = F.relu(output)
+        output_1 = self.w_1(x)
+        output_1 = F.relu(output_1)
         
         # 然后通过dropout,并执行第二个线性层映射
-        output = self.dropout(output)
+        output = self.dropout(output_1)
         output = self.w_2(output)
         return output
 
@@ -180,13 +176,13 @@ class MultiHeadAttention(nn.Module):
     # 多头注意力层,与缩放点积注意力层的区别在于,对每个head进行了并行计算
     # 输入向量大小[batch_size, seq_len, word_emb_d]
     # 注意力权重可以根据需要经过dropout层
-    # 初始化时指定词镶嵌维度大小word_emb_d，模型维度d_model和head数量num_heads,根据d_model计算每个head的维度head_dim
+    # 初始化时指定，模型维度d_model和head数量num_heads,根据d_model计算每个head的维度head_dim
     # 通过线性映射分别得到Q,K,V向量,它们的形状为[batch_size,num_heads,seq_len,head_dim]
     # 如果提供了掩码mask,就对其扩展成多头情况的掩码[batch_size,num_heads,seq_len,seq_len]
     # 对于每个head,分别计算Q,K,V的缩放点积注意力,得到每个head的输出和注意力权重
     # 将所有head的输出沿着head维度concatenate起来
     # 最终通过线性映射输出形状为[batch_size,seq_len,d_model]结果
-    def __init__(self, d_model: int=512, num_heads: int=4, dropout:float=0.1, word_emb_d=None):
+    def __init__(self, d_model: int, num_heads: int, dropout:float, word_emb_d=None):
         super(MultiHeadAttention, self).__init__()
         if word_emb_d is None:
             word_emb_d = d_model
@@ -212,7 +208,7 @@ class MultiHeadAttention(nn.Module):
         """
         将d_model按照头数分割
         : 输入all_heads_tensor: [batch_size, seq_leng, d_model]
-        : 输出head_tensor: [batch_size, c, seq_len, head_dim]
+        : 输出head_tensor: [batch_size,num_heads, seq_len, head_dim]
         """
         batch_size, seq_len, _ = all_heads_tensor.size()
 
@@ -225,8 +221,8 @@ class MultiHeadAttention(nn.Module):
         batch_size, seq_len, _  = q.size()
         # 得到的新向量为[batch_size, seq_len, d_model]
         q = self.q_linear(q) 
-        k = self.q_linear(k)
-        v = self.q_linear(v)
+        k = self.k_linear(k)
+        v = self.v_linear(v)
 
         # 得到每一个head 的独立矩阵[batch_size, num_heads, seq_len, head_dim]
         q = self.head_split(q)
@@ -392,14 +388,7 @@ class Transformer(nn.Module):
         # 定义输出全连接层，将d_model维度转换为目标词汇表大小
         self.fc_out = nn.Linear(d_model, tgt_vocab_size)
         
-    def make_src_mask(self, src: torch.Tensor) -> torch.Tensor:
-        # src:[batch_size, src_len]
-        # 创建源序列掩码: [batch_size, 1, src_len]
-        # 掩码中值为0的地方表示需要忽略的位置
-        src_mask = (src != 0).unsqueeze(1)
-        return src_mask
-    
-    def make_tgt_mask(self, tgt: torch.Tensor) -> torch.Tensor:
+    def _make_tgt_mask(self, tgt: torch.Tensor) -> torch.Tensor:
         # tgt: [batch_size, tgt_len]
         # 创建目标序列掩码: [batch_size, tgt_len, tgt_len]
         batch_size, tgt_len = tgt.size()
@@ -413,16 +402,18 @@ class Transformer(nn.Module):
         tgt_mask = tgt_mask.repeat(batch_size, 1, 1)
         return tgt_mask
     
-    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> Tuple[
+    def forward(self, src: torch.Tensor, 
+                tgt: torch.Tensor, 
+                src_mask: Optional[torch.Tensor]=None) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         src: [batch_size, src_length]
-        tgt:
-        return: 
+        tgt:[[batch_size, tgt_length]
+        src_mask(Optional): [batch_size, 1, src_len] 
+        out:[batch_size, tgt_length, tgt_vocab_size] 
         """
         # 获取源序列和目标序列的掩码
-        src_mask = self.make_src_mask(src)
-        tgt_mask = self.make_tgt_mask(tgt)
+        tgt_mask = self._make_tgt_mask(tgt)
         
         # 编码器处理源序列，并生成编码后的表示和注意力权重
         src_emb = self.src_embedding(src) # [batch_size, src_len, d_model]
@@ -441,21 +432,3 @@ class Transformer(nn.Module):
         # 返回输出、编码器注意力权重、解码器自注意力权重、解码器编码器注意力权重
         return out, enc_attn_weights, dec_attn_weights, dec_enc_attn_weights
 
-class TextClassifier(nn.Module):
-    # 使用Transformer作为编码器的文本分类模型
-    # 初始化时指定词汇量大小,类别数量,以及Transformer参数
-    # 在前向逻辑中:
-    #   1. 将输入序列通过Transformer编码,获取序列的输出表示
-    #   2. 取出编码器输出中的第一个token作为文档表示
-    #   3. 将文档表示通过分类器的线性层输出分类分数
-    # 可以根据输出分数使用交叉熵损失进行模型训练
-    def __init__(self, vocab_size, num_classes, d_model=512, num_heads=8, num_layers=6):
-        super(TextClassifier, self).__init__()
-        self.transformer = Transformer(vocab_size, vocab_size, d_model, num_heads, num_layers)
-        self.classifier = nn.Linear(d_model, num_classes)
-
-    def forward(self, inputs, masks=None):
-        outputs, _, _ = self.transformer(inputs, inputs, masks, masks)
-        outputs = outputs[:, 0, :]  # 只取序列的第一个token
-        logits = self.classifier(outputs)
-        return logits

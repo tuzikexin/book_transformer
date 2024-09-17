@@ -1,11 +1,13 @@
 import matplotlib.pyplot as plt
 import torch
-from pytorch_transformer import (MultiHeadAttention, Decoder,Encoder,Transformer,
+from transformers import BertTokenizer
+from transformer import (MultiHeadAttention, Decoder,Encoder,Transformer,
                                  InputEmbeddings, PositionalEncoding, LearnablePositionalEncoding,
                                  PositionwiseFeedForward, AddNorm)
 
 
 print("# ============================ MultiHeadAttention 使用示例: ============================")
+# 假设我们有以下输入
 batch_size = 2
 seq_len = 5
 word_emb_d = 256
@@ -13,7 +15,7 @@ d_model = 512
 num_heads = 4
 dummy_input = torch.rand(batch_size, seq_len, word_emb_d)
 
-multi_head_attn = MultiHeadAttention(word_emb_d=word_emb_d, d_model=d_model, num_heads=num_heads)
+multi_head_attn = MultiHeadAttention(word_emb_d=word_emb_d, d_model=d_model, num_heads=num_heads, dropout=0.1)
 output, attn_weights = multi_head_attn(dummy_input, dummy_input, dummy_input)
 
 print("Output shape:", output.shape)
@@ -144,6 +146,7 @@ print(f"Decoder Self-Attention Weights has {len(dec_attn_weights)} layers, each 
 print(f"Decoder-Encoder Attention Weights has {len(dec_enc_attn_weights)} layers, each one has shape {dec_enc_attn_weights[0].shape}")
 
 print("# ============================== Transformer 使用示例 ==============================")
+# 假设我们有以下输入
 src_vocab_size = 1000
 tgt_vocab_size = 200
 d_model = 512
@@ -173,3 +176,48 @@ print(f"The encoder self-attention scores shape: {enc_attn_weights[0].shape}") #
 print(f"The decoder corss attention scores shape: {dec_attn_weights[0].shape}") # [batch_size, head, tgt_len, tgt_len]
 print(f"The number of decoder layer: {len(dec_attn_weights)}")
 print(f"Final output has shape: {out.shape}")  # [batch_size, tgt_len, tgt_vocab_size]
+
+print("# ========================== example for tokenizer & mask ==========================")
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+# 示例文本
+text = "Transformers are great."
+
+# 初始化分词器
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+# 对文本进行分词
+tokens = tokenizer.tokenize(text)
+print("Tokens:", tokens)
+
+# 将令牌转换为输入ID
+input_ids = tokenizer.convert_tokens_to_ids(tokens)
+print("Input IDs:", input_ids)
+
+print("# ========================== example for tokenizer & mask ==========================")
+# 自定义mask函数
+def create_masks(inputs, pad_token_id):
+    mask = (inputs != pad_token_id).float()
+    return mask
+
+# 示例文本
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+sentences = ["Transformers are great.", 
+             "They have revolutionized NLP."]
+
+# 使用tokenizer对一个文本list添加特殊标记并创建注意力掩码
+encoded_input = tokenizer(
+    sentences,
+    add_special_tokens=True,  # 添加 [CLS] 和 [SEP] 标记
+    max_length=10,  # 填充和截断到最大长度
+    padding='max_length',  # 填充到最大长度
+    return_attention_mask=True,  # 返回注意力掩码
+    return_tensors='pt',  # 返回PyTorch张量
+    truncation=True,
+)
+
+print("Encoded Input:")
+for k,v in encoded_input.items():
+    print(f"   {k}: {v}")
+
+print("# ========================== example for Dataloader & mask ==========================")

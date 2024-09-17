@@ -1,6 +1,6 @@
 # 可以运行pytest来执行这些测试
 
-from chapter2.pytorch_transformer import (
+from chapter2.transformer import (
     ScaledDotProductAttention, MultiHeadAttention, 
     PositionwiseFeedForward, AddNorm, EncoderLayer,Encoder,
     LearnablePositionalEncoding, InputEmbeddings, PositionalEncoding,
