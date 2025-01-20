@@ -6,3 +6,4 @@ datasets==2.21.0
 pandas==2.2.2
 matplotlib==3.9.0
 pytest==8.2.2
+akshare==1.14.93
