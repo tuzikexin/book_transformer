@@ -3,6 +3,11 @@
 *.csv
 *.pd
 *.txt
+*.tsv
+*.png
+*.json
+*.safetensors
+chapter*/*.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
