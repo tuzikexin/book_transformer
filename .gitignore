@@ -2,12 +2,15 @@
 *.jpg
 *.csv
 *.pd
-*.txt
 *.tsv
 *.png
 *.json
 *.safetensors
 chapter*/*.md
+*.txt
+
+# Except requirement.txt
+!requirement.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
