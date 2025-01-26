@@ -2,7 +2,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from chapter8.cnn_dataset import CNNDailyMailDataset
+from chapter8.chapter8_train import CNNDailyMailDataset
 import pandas as pd
 from collections import Counter
 
